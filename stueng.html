@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Scanner</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  html,body { height:100%; margin:0; }
+  body {
+    display:grid; place-items:center;
+    background:#ffffff; color:#0b0b0b;
+    font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    transition: background-color .18s ease;
+  }
+  .center { text-align:center; }
+  .title { font-size: clamp(28px, 6vw, 56px); margin:0 0 .25em 0; font-weight:700; }
+  .sub   { font-size: clamp(16px, 2.5vw, 22px); opacity:.9; margin:0; min-height:1.6em; }
+  .btn { background:#0b0b0b; color:#ffffff; border:0; border-radius:10px; padding:10px 14px; cursor:pointer; }
+  .btn-bar { position:fixed; top:14px; right:14px; display:flex; gap:8px; }
+  .hidden { display:none !important; }
+  .count { position:fixed; left:14px; top:14px; opacity:.85; font-size:14px; }
+  .hidden-input { position:absolute; opacity:0; pointer-events:none; width:1px; height:1px; left:-9999px; }
+  .ok  { color:#0b6b2d; }
+  .err { color:#b00020; }
+  .idle{ color:#444; }
+  .bg-ok  { background:#c8f7c5 !important; }  /* light green flash */
+  .bg-err { background:#f9c5c5 !important; }  /* light red flash   */
+</style>
+<body>
+  <!-- hidden input to receive keystrokes -->
+  <input id="sink" class="hidden-input" autocomplete="off" autocorrect="off" spellcheck="false">
+
+  <div class="center">
+    <h1 id="title" class="title idle">Please scan ID</h1>
+    <p  id="sub"   class="sub   idle">Ready</p>
+  </div>
+
+  <div id="btnBar" class="btn-bar">
+    <button id="importBtn" class="btn" aria-label="Import CSV">Import</button>
+    <button id="exportBtn" class="btn" aria-label="Export CSV">Export</button>
+    <button id="clearBtn"  class="btn" aria-label="Clear Data">Clear</button>
+    <input id="fileInput" type="file" accept=".csv,text/csv" class="hidden-input">
+  </div>
+
+  <div id="count" class="count" aria-live="polite">0 saved</div>
+
+<script>
+/* ===== Config ===== */
+const CLEAN_LEN = 7;
+const LS_KEY = "inroll_scans_unique_v2";
+const FLASH_MS = 320;
+const RESET_MS = 3000;
+const ENTER_DEBOUNCE_MS = 250;
+
+/* ===== Storage (localStorage) =====
+   Store array of { clean_id: "#######", time: "HH:MM:SS", raw: "..." }
+   Export/import uses UNIQUE (clean_id,time); dedupe by clean_id locally. */
+let scans = [];
+let index = new Set(); // dedupe by clean_id
+function loadScans() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) throw new Error("Bad format");
+    scans = arr.filter(r => r && typeof r.clean_id === "string" && typeof r.time === "string");
+    index = new Set(scans.map(r => r.clean_id));
+  } catch {
+    scans = []; index = new Set();
+  }
+}
+function saveScans() {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(scans)); } catch {}
+}
+function clearScans() {
+  if (!confirm("Clear all saved scans from this device?")) return;
+  scans = []; index = new Set();
+  try { localStorage.removeItem(LS_KEY); } catch {}
+  updateCount(); resetView(); flash("ok"); setMsg("Cleared", "Please scan ID", "idle");
+}
+function updateCount(){ document.getElementById("count").textContent = `${scans.length} saved`; }
+
+/* ===== Utils ===== */
+function extractID(s) {
+  // first 7 consecutive digits; preserves leading/trailing zeros
+  const m = String(s).match(/\d{7}/);
+  return m ? m[0] : null;
+}
+function localTimeString() {
+  // local time only, 24h "HH:MM:SS"
+  return new Date().toLocaleTimeString([], { hour12:false });
+}
+function csvEscape(v){ return `"${String(v).replaceAll('"','""')}"`; }
+function exportCSV() {
+  // Export UNIQUE (clean_id,time). If multiple times exist elsewhere, local one wins.
+  const header = ["clean_id","time"];
+  const lines = [header.join(",")];
+  for (const r of scans) lines.push([r.clean_id, r.time].map(csvEscape).join(","));
+  const blob = new Blob([lines.join("\r\n")], {type:"text/csv"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `scans_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ===== CSV parsing for Import ===== */
+function splitCSVLine(line) {
+  const out = []; let cur = "", inQ = false;
+  for (let i=0;i<line.length;i++){
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQ && line[i+1] === '"'){ cur += '"'; i++; }
+      else inQ = !inQ;
+    } else if (ch === ',' && !inQ) { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+function parseCSV(text) {
+  const rows = [];
+  text = text.replace(/^\uFEFF/, ""); // strip BOM
+  const lines = text.split(/\r?\n/).filter(l => l.length);
+  if (lines.length === 0) return rows;
+  const headers = splitCSVLine(lines.shift()).map(h => h.trim().toLowerCase());
+  for (const line of lines) {
+    const cells = splitCSVLine(line);
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = cells[i] ?? "");
+    rows.push(obj);
+  }
+  return rows;
+}
+async function importCSVFile(file){
+  if (!file) return;
+  const text = await file.text();
+  const rows = parseCSV(text);
+  let inserted = 0, dups = 0, skipped = 0;
+
+  // Accept columns: clean_id + time (preferred).
+  // Back-compat: also accept time_local / timestamp_iso; ignore raw fields.
+  for (const r of rows) {
+    const cid = extractID(r.clean_id ?? r.id ?? "");
+    const time = (r.time || r.time_local || r.timestamp_iso || "").trim();
+    if (!cid) { skipped++; continue; }
+    if (index.has(cid)) { dups++; continue; }
+    const t = time || localTimeString();
+    scans.push({ clean_id: cid, time: t, raw: "" });
+    index.add(cid);
+    inserted++;
+  }
+  saveScans(); updateCount();
+  flash("ok");
+  setMsg(`Imported ${inserted}`, dups ? `${dups} duplicate${dups>1?"s":""} ignored` : "Done", "ok");
+}
+
+/* ===== UI state & helpers ===== */
+let resetTimer = null;
+let flashTimer = null;
+let lastActionAt = Date.now();
+function setMsg(main, sub, kind) {
+  const t = document.getElementById("title");
+  const s = document.getElementById("sub");
+  t.textContent = main; s.textContent = sub;
+  t.className = `title ${kind}`; s.className = `sub ${kind}`;
+  if (resetTimer) clearTimeout(resetTimer);
+  if (kind !== "idle") resetTimer = setTimeout(resetView, RESET_MS);
+  lastActionAt = Date.now();
+}
+function resetView() {
+  document.body.classList.remove("bg-ok","bg-err");
+  setMsg("Please scan ID", "Ready", "idle");
+}
+function flash(kind){
+  document.body.classList.remove("bg-ok","bg-err");
+  document.body.classList.add(kind === "ok" ? "bg-ok" : "bg-err");
+  if (flashTimer) clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => document.body.classList.remove("bg-ok","bg-err"), FLASH_MS);
+}
+
+/* ===== App logic ===== */
+loadScans(); updateCount();
+
+const sink = document.getElementById("sink");
+const fileInput = document.getElementById("fileInput");
+document.getElementById("exportBtn").addEventListener("click", exportCSV);
+document.getElementById("clearBtn").addEventListener("click", clearScans);
+document.getElementById("importBtn").addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const f = fileInput.files && fileInput.files[0];
+  importCSVFile(f).finally(()=> fileInput.value = "");
+});
+
+/* ===== Fullscreen / Kiosk detection (handles F11) ===== */
+function isFullscreenLike() {
+  const domFS = !!document.fullscreenElement;
+  const pwaFS = window.matchMedia && window.matchMedia('(display-mode: fullscreen)').matches;
+  const sizeFS = Math.abs(window.innerHeight - screen.height) <= 1 &&
+                 Math.abs(window.innerWidth  - screen.width ) <= 1;
+  return domFS || pwaFS || sizeFS;
+}
+function updateUiMode() {
+  const bar = document.getElementById('btnBar');
+  if (!bar) return;
+  if (isFullscreenLike()) bar.classList.add('hidden');
+  else bar.classList.remove('hidden');
+}
+['fullscreenchange','resize','orientationchange','pageshow','visibilitychange']
+  .forEach(ev => addEventListener(ev, updateUiMode));
+updateUiMode();
+setInterval(updateUiMode, 1000); // safety watchdog
+
+/* ===== Focus lock & interaction ===== */
+function focusSink(){ sink.focus(); }
+addEventListener("click", focusSink, true);
+addEventListener("keydown", (e)=> {
+  if (e.key === "Escape") resetView();
+  focusSink();
+}, true);
+addEventListener("visibilitychange", () => {
+  if (!document.hidden) { resetView(); focusSink(); }
+});
+focusSink();
+
+// Accept paste (some scanners paste whole string)
+sink.addEventListener("paste", (e)=>{
+  try{
+    const txt = (e.clipboardData || window.clipboardData).getData("text") || "";
+    if (txt) processScan(txt);
+  }catch{}
+});
+
+// Buffer keys until Enter
+let buffer = "";
+let lastEnterTs = 0;
+sink.addEventListener("keydown", (e) => {
+  try {
+    if (e.key === "Enter") {
+      const now = Date.now();
+      if (now - lastEnterTs < ENTER_DEBOUNCE_MS) return; // debounce Enter bursts
+      lastEnterTs = now;
+      const rawInput = buffer.length ? buffer : sink.value;
+      buffer = ""; sink.value = "";
+      const raw = (rawInput||"").replaceAll("\r","").replaceAll("\n","").trim();
+      if (raw) processScan(raw); else resetView();
+      return;
+    }
+    if (e.key.length === 1) buffer += e.key; // collect printable
+  } catch {
+    flash("err"); setMsg("Error", "Please scan again", "err");
+  }
+});
+
+function processScan(raw){
+  try {
+    const clean = extractID(raw);
+    if (!clean) {
+      flash("err"); setMsg("Invalid scan", "Please try again", "err"); return;
+    }
+    if (!index.has(clean)) {
+      scans.push({ clean_id: clean, time: localTimeString(), raw });
+      index.add(clean); saveScans(); updateCount();
+    }
+    flash("ok"); setMsg("Thank you", "You may go in", "ok");
+  } catch {
+    flash("err"); setMsg("Error", "Please scan again", "err");
+  }
+}
+
+/* Watchdog: recover from weird states */
+setInterval(() => {
+  if (document.activeElement !== sink) focusSink();
+  const t = document.getElementById("title");
+  const showingIdle = t.classList.contains("idle");
+  if (!showingIdle && Date.now() - lastActionAt > RESET_MS + 500) resetView();
+  if (document.body.classList.contains("bg-ok")||document.body.classList.contains("bg-err")){
+    if (Date.now() - lastActionAt > FLASH_MS + 500) document.body.classList.remove("bg-ok","bg-err");
+  }
+}, 500);
+
+resetView();
+</script>
+</body>
+</html>
